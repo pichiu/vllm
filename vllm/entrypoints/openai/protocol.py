@@ -105,7 +105,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
-    model: str
+    model: Optional[str] = None
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[bool] = False
@@ -267,7 +267,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 class CompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
-    model: str
+    model: Optional[str] = None
     prompt: Union[List[int], List[List[int]], str, List[str]]
     best_of: Optional[int] = None
     echo: Optional[bool] = False
