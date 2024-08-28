@@ -12,6 +12,9 @@ from vllm.model_executor.model_loader.loader import build_model
 from vllm.model_executor.models import ModelRegistry
 from vllm.multimodal import BatchedTensors
 from vllm.utils import is_pin_memory_available
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def filter_weights(weights: Iterable[Tuple[str, torch.Tensor]], prefix: str):
@@ -66,12 +69,17 @@ def merge_multimodal_embeddings(input_ids: torch.Tensor,
     Note:
         This updates ``inputs_embeds`` in place.
     """
+    logger.info(f"input ids: size={input_ids.size()}, {input_ids}\ninput embeds: size={inputs_embeds.size()}, {inputs_embeds}\nplaceholder token id: {placeholder_token_id}")
     mask = (input_ids == placeholder_token_id)
     num_expected_tokens = mask.sum()
+    logger.info(f"mask: size={mask.size()}, {mask}\nnum expected tokens: {num_expected_tokens}")
 
     if isinstance(multimodal_embeddings, torch.Tensor):
+        logger.info("multimodal_embeddings is Tensor")
+        logger.info(f"multimodal embeddings: size={multimodal_embeddings.size()}, {multimodal_embeddings}")
         batch_size, batch_tokens, *_, embed_dim = multimodal_embeddings.shape
         total_tokens = batch_size * batch_tokens
+        logger.info(f"total tokens: {total_tokens}\nbatch size={batch_size}\nbatch tokens={batch_tokens}\nembed dim={embed_dim}")
         if num_expected_tokens != total_tokens:
             expr = f"{batch_size} x {batch_tokens}"
             raise ValueError(
@@ -81,8 +89,12 @@ def merge_multimodal_embeddings(input_ids: torch.Tensor,
         inputs_embeds[mask] = multimodal_embeddings.view(
             total_tokens, embed_dim)
     else:
+        logger.info("multimodal_embeddings not Tensor")
+        multimodal_embeddings_sizes = [m.size() for m in multimodal_embeddings]
+        logger.info(f"multimodal embeddings: size={len(multimodal_embeddings)}, {multimodal_embeddings_sizes}\n{multimodal_embeddings}")
         size_per_batch = [t.shape[0] for t in multimodal_embeddings]
         total_tokens = sum(size_per_batch)
+        logger.info(f"total tokens: {total_tokens}\nsize per batch: {size_per_batch}")
         if num_expected_tokens != total_tokens:
             expr = ' + '.join(map(str, size_per_batch))
             raise ValueError(
@@ -90,6 +102,7 @@ def merge_multimodal_embeddings(input_ids: torch.Tensor,
                 f"multimodal tokens to {num_expected_tokens} placeholders")
 
         inputs_embeds[mask] = torch.cat(multimodal_embeddings)
+    logger.info(f"inputs embeds: size={inputs_embeds.size()}, {inputs_embeds}")
 
     return inputs_embeds
 

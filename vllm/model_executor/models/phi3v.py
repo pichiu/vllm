@@ -398,6 +398,9 @@ def input_processor_for_phi3v(ctx: InputContext, llm_inputs: LLMInputs):
     model_config = ctx.model_config
     hf_config = ctx.get_hf_image_processor_config()
 
+    logger.info(f"hf config: {hf_config}")
+    logger.info(f"llm inputs: {llm_inputs}")
+
     image_data = multi_modal_data["image"]
     if isinstance(image_data, Image.Image):
         w, h = image_data.size
@@ -436,6 +439,7 @@ def input_processor_for_phi3v(ctx: InputContext, llm_inputs: LLMInputs):
             assert num_image_tags == len(
                 image_data), "The count of image_placeholder not match image's"
         new_prompt = prompt
+    logger.info(f"new prompt: {new_prompt}\nimage idx: {image_idx}")
 
     prompt_token_ids = llm_inputs["prompt_token_ids"].copy()
 
