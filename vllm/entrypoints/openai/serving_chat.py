@@ -95,6 +95,7 @@ class OpenAIServingChat(OpenAIServing):
 
             conversation, mm_futures = parse_chat_messages(
                 request.messages, model_config, tokenizer)
+            # logger.info(f"conversation: {conversation}\nmm_futures: {mm_futures}")
 
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
@@ -109,6 +110,7 @@ class OpenAIServingChat(OpenAIServing):
                 documents=request.documents,
                 **(request.chat_template_kwargs or {}),
             )
+            # logger.info(f"prompt: {prompt}")
         except Exception as e:
             logger.error("Error in applying chat template from request: %s", e)
             return self.create_error_response(str(e))
@@ -121,6 +123,7 @@ class OpenAIServingChat(OpenAIServing):
                     mm_futures
                 ) == 1, "Multiple 'image_url' input is currently not supported."
                 mm_data = await mm_futures[0]
+                logger.info(f"mm_data: {mm_data}")
         except Exception as e:
             logger.error("Error in loading multi-modal data: %s", e)
             return self.create_error_response(str(e))
@@ -137,6 +140,8 @@ class OpenAIServingChat(OpenAIServing):
                 truncate_prompt_tokens=request.truncate_prompt_tokens,
                 add_special_tokens=request.add_special_tokens,
             )
+            # logger.info(f"prompt_inputs: {prompt_inputs}")
+            logger.info(f"default max tokens: max model len({self.max_model_len}) - prompt input length({len(prompt_inputs['prompt_token_ids'])})")
 
             sampling_params = request.to_sampling_params(
                 tokenizer,
@@ -154,6 +159,7 @@ class OpenAIServingChat(OpenAIServing):
                 prompt_token_ids=prompt_inputs["prompt_token_ids"])
             if mm_data is not None:
                 engine_inputs["multi_modal_data"] = mm_data
+            logger.info(f"engine_inputs: {engine_inputs}")
 
             is_tracing_enabled = (
                 await self.async_engine_client.is_tracing_enabled())
