@@ -40,6 +40,7 @@ from backend_request_func import (ASYNC_REQUEST_FUNCS, RequestFuncInput,
                                   RequestFuncOutput)
 from datasets import load_dataset
 from PIL.Image import Image
+from PIL import Image as PILImage
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
@@ -53,6 +54,8 @@ try:
 except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
 
+MILLISECONDS_TO_SECONDS_CONVERSION = 1000
+
 
 @dataclass
 class BenchmarkMetrics:
@@ -60,6 +63,7 @@ class BenchmarkMetrics:
     total_input: int
     total_output: int
     request_throughput: float
+    request_goodput: float
     output_throughput: float
     total_token_throughput: float
     mean_ttft_ms: float
@@ -202,6 +206,7 @@ def sample_hf_requests(
     dataset_split: str,
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
+    random_seed: int,
     fixed_output_len: Optional[int] = None,
 ) -> List[Tuple[str, str, int, Optional[Dict[str, Collection[str]]]]]:
     dataset = load_dataset(dataset_path,
@@ -210,8 +215,8 @@ def sample_hf_requests(
                            streaming=True)
     assert "conversations" in dataset.features, (
         "HF Dataset must have 'conversations' column.")
-    filtered_dataset = dataset.shuffle().filter(
-        lambda x: len(x["conversations"]) >= 2)
+    filter_func = lambda x: len(x["conversations"]) >= 2
+    filtered_dataset = dataset.shuffle(seed=random_seed).filter(filter_func)
     sampled_requests: List[Tuple[str, int, int, Dict[str,
                                                      Collection[str]]]] = []
     for data in filtered_dataset:
@@ -254,6 +259,43 @@ def sample_hf_requests(
 
     return sampled_requests
 
+def sample_ocisvision_requests(
+    im_width: int,
+    im_height: int,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    fixed_input_len: Optional[int] = None,
+    fixed_output_len: Optional[int] = None,
+) -> List[Tuple[str, str, int, Optional[Dict[str, Collection[str]]]]]:
+    sampled_requests: List[Tuple[str, int, int, Dict[str,
+                                                     Collection[str]]]] = []
+
+    offsets = np.random.randint(0, tokenizer.vocab_size, size=num_requests)
+    
+    for i in range(num_requests):
+        prompt = tokenizer.decode(offsets[i])
+        prompt = prompt * (fixed_input_len-1)
+        # 生成隨機的 RGB 數據
+        # 數組形狀為 (高度, 寬度, 3)，每個值在 0-255 之間
+        random_image_array = np.random.randint(0, 256, (im_height, im_width, 3), dtype=np.uint8)
+
+        # 將數據轉換為圖片
+        image = PILImage.fromarray(random_image_array, 'RGB')
+        image_data = io.BytesIO()
+        image.save(image_data, format='JPEG')
+        image_base64 = base64.b64encode(image_data.getvalue()).decode("utf-8")
+        mm_content = {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{image_base64}"
+            },
+        }
+    
+
+        sampled_requests.append((prompt, fixed_input_len, fixed_output_len, mm_content))
+
+    return sampled_requests
+
 
 def sample_random_requests(
     prefix_len: int,
@@ -280,10 +322,11 @@ def sample_random_requests(
     offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
     input_requests = []
     for i in range(num_prompts):
-        prompt = tokenizer.decode(prefix_token_ids +
-                                  [(offsets[i] + i + j) % tokenizer.vocab_size
-                                   for j in range(input_lens[i])])
-
+        #prompt = tokenizer.decode(prefix_token_ids +
+        #                          [(offsets[i] + i + j) % tokenizer.vocab_size
+        #                           for j in range(input_lens[i])])
+        prompt = tokenizer.decode(offsets[i])
+        prompt = prompt * (input_len-1)
         input_requests.append((prompt, int(prefix_len + input_lens[i]),
                                int(output_lens[i]), None))
 
@@ -293,8 +336,33 @@ def sample_random_requests(
 async def get_request(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
+    burstiness: float = 1.0,
 ) -> AsyncGenerator[Tuple[str, int, int], None]:
+    """
+    Asynchronously generates requests at a specified rate 
+    with OPTIONAL burstiness.
+    
+    Args:
+        input_requests: 
+            A list of input requests, each represented as a tuple.
+        request_rate: 
+            The rate at which requests are generated (requests/s).
+        burstiness (optional): 
+            The burstiness factor of the request generation. 
+            Only takes effect when request_rate is not inf.
+            Default value is 1, which follows a Poisson process.
+            Otherwise, the request intervals follow a gamma distribution.
+            A lower burstiness value (0 < burstiness < 1) results 
+            in more bursty requests, while a higher burstiness value 
+            (burstiness > 1) results in a more uniform arrival of requests.
+    """
     input_requests = iter(input_requests)
+
+    # Calculate scale parameter theta to maintain the desired request_rate.
+    assert burstiness > 0, (
+        f"A positive burstiness factor is expected, but given {burstiness}.")
+    theta = 1.0 / (request_rate * burstiness)
+
     for request in input_requests:
         yield request
 
@@ -302,8 +370,9 @@ async def get_request(
             # If the request rate is infinity, then we don't need to wait.
             continue
 
-        # Sample the request interval from the exponential distribution.
-        interval = np.random.exponential(1.0 / request_rate)
+        # Sample the request interval from the gamma distribution.
+        # If burstiness is 1, it follows exponential distribution.
+        interval = np.random.gamma(shape=burstiness, scale=theta)
         # The next request will be sent after the interval.
         await asyncio.sleep(interval)
 
@@ -315,12 +384,15 @@ def calculate_metrics(
     tokenizer: PreTrainedTokenizerBase,
     selected_percentile_metrics: List[str],
     selected_percentiles: List[float],
+    gootput_config_dict: Dict[str, float],
 ) -> Tuple[BenchmarkMetrics, List[int]]:
     actual_output_lens: List[int] = []
     total_input = 0
     completed = 0
+    good_completed = 0
     itls: List[float] = []
     tpots: List[float] = []
+    all_tpots: List[float] = []
     ttfts: List[float] = []
     e2els: List[float] = []
     for i in range(len(outputs)):
@@ -332,17 +404,45 @@ def calculate_metrics(
             output_len = len(
                 tokenizer(outputs[i].generated_text,
                           add_special_tokens=False).input_ids)
+            #output_len = len(outputs[i].itl)
+            #print(output_len)
             actual_output_lens.append(output_len)
             total_input += input_requests[i][1]
+            tpot = 0
             if output_len > 1:
-                tpots.append(
-                    (outputs[i].latency - outputs[i].ttft) / (output_len - 1))
+                tpot = (outputs[i].latency - outputs[i].ttft) / (output_len -
+                                                                 1)
+                tpots.append(tpot)
+            # Note: if output_len <= 1, we regard tpot as 0 for goodput
+            all_tpots.append(tpot)
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
             completed += 1
         else:
             actual_output_lens.append(0)
+
+    if gootput_config_dict:
+        valid_metrics = []
+        slo_values = []
+
+        if "ttft" in gootput_config_dict:
+            valid_metrics.append(ttfts)
+            slo_values.append(gootput_config_dict["ttft"] /
+                              MILLISECONDS_TO_SECONDS_CONVERSION)
+        if "tpot" in gootput_config_dict:
+            valid_metrics.append(all_tpots)
+            slo_values.append(gootput_config_dict["tpot"] /
+                              MILLISECONDS_TO_SECONDS_CONVERSION)
+        if "e2el" in gootput_config_dict:
+            valid_metrics.append(e2els)
+            slo_values.append(gootput_config_dict["e2el"] /
+                              MILLISECONDS_TO_SECONDS_CONVERSION)
+
+        for req_metric in zip(*valid_metrics):
+            is_good_req = all([s >= r for s, r in zip(slo_values, req_metric)])
+            if is_good_req:
+                good_completed += 1
 
     if completed == 0:
         warnings.warn(
@@ -354,6 +454,7 @@ def calculate_metrics(
         total_input=total_input,
         total_output=sum(actual_output_lens),
         request_throughput=completed / dur_s,
+        request_goodput=good_completed / dur_s,
         output_throughput=sum(actual_output_lens) / dur_s,
         total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0) *
@@ -372,9 +473,9 @@ def calculate_metrics(
         median_itl_ms=np.median(itls or 0) * 1000,
         percentiles_itl_ms=[(p, np.percentile(itls or 0, p) * 1000)
                             for p in selected_percentiles],
-        mean_e2el_ms=np.median(e2els or 0) * 1000,
+        mean_e2el_ms=np.mean(e2els or 0) * 1000,
         std_e2el_ms=np.std(e2els or 0) * 1000,
-        median_e2el_ms=np.mean(e2els or 0) * 1000,
+        median_e2el_ms=np.median(e2els or 0) * 1000,
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
                              for p in selected_percentiles],
     )
@@ -392,11 +493,14 @@ async def benchmark(
     logprobs: Optional[int],
     best_of: int,
     request_rate: float,
+    burstiness: float,
     disable_tqdm: bool,
     profile: bool,
     selected_percentile_metrics: List[str],
     selected_percentiles: List[str],
     ignore_eos: bool,
+    gootput_config_dict: Dict[str, float],
+    max_concurrency: Optional[int],
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -444,13 +548,35 @@ async def benchmark(
         if profile_output.success:
             print("Profiler started")
 
+    if burstiness == 1.0:
+        distribution = "Poisson process"
+    else:
+        distribution = "Gamma distribution"
+
     print(f"Traffic request rate: {request_rate}")
+    print(f"Burstiness factor: {burstiness} ({distribution})")
+    print(f"Maximum request concurrency: {max_concurrency}")
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
+    # This can be used once the minimum Python version is 3.10 or higher,
+    # and it will simplify the code in limited_request_func.
+    #    semaphore = (asyncio.Semaphore(max_concurrency)
+    #                 if max_concurrency else contextlib.nullcontext())
+    semaphore = (asyncio.Semaphore(max_concurrency)
+                 if max_concurrency else None)
+
+    async def limited_request_func(request_func_input, pbar):
+        if semaphore is None:
+            return await request_func(request_func_input=request_func_input,
+                                      pbar=pbar)
+        async with semaphore:
+            return await request_func(request_func_input=request_func_input,
+                                      pbar=pbar)
+
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
-    async for request in get_request(input_requests, request_rate):
+    async for request in get_request(input_requests, request_rate, burstiness):
         prompt, prompt_len, output_len, mm_content = request
         request_func_input = RequestFuncInput(model=model_id,
                                               prompt=prompt,
@@ -463,8 +589,8 @@ async def benchmark(
                                               ignore_eos=ignore_eos)
         tasks.append(
             asyncio.create_task(
-                request_func(request_func_input=request_func_input,
-                             pbar=pbar)))
+                limited_request_func(request_func_input=request_func_input,
+                                     pbar=pbar)))
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     if profile:
@@ -494,6 +620,7 @@ async def benchmark(
         tokenizer=tokenizer,
         selected_percentile_metrics=selected_percentile_metrics,
         selected_percentiles=selected_percentiles,
+        gootput_config_dict=gootput_config_dict,
     )
 
     print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
@@ -505,6 +632,9 @@ async def benchmark(
                                  metrics.total_output))
     print("{:<40} {:<10.2f}".format("Request throughput (req/s):",
                                     metrics.request_throughput))
+    if gootput_config_dict:
+        print("{:<40} {:<10.2f}".format("Request goodput (req/s):",
+                                        metrics.request_goodput))
     print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):",
                                     metrics.output_throughput))
     print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
@@ -516,6 +646,8 @@ async def benchmark(
         "total_input_tokens": metrics.total_input,
         "total_output_tokens": metrics.total_output,
         "request_throughput": metrics.request_throughput,
+        "request_goodput:":
+        metrics.request_goodput if gootput_config_dict else None,
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
         "input_lens": [output.prompt_len for output in outputs],
@@ -567,6 +699,41 @@ async def benchmark(
     print("=" * 50)
 
     return result
+
+
+def check_goodput_args(args):
+    # Check and parse goodput arguments
+    gootput_config_dict = {}
+    VALID_NAMES = ["ttft", "tpot", "e2el"]
+    if args.goodput:
+        gootput_config_dict = parse_goodput(args.goodput)
+        for slo_name, slo_val in gootput_config_dict.items():
+            if slo_name not in VALID_NAMES:
+                raise ValueError(
+                    f"Invalid metric name found, {slo_name}: {slo_val}. "
+                    "The service level objective name should be one of "
+                    f"{str(VALID_NAMES)}. ")
+            if slo_val < 0:
+                raise ValueError(
+                    f"Invalid value found, {slo_name}: {slo_val}. "
+                    "The service level objective value should be "
+                    "non-negative.")
+    return gootput_config_dict
+
+
+def parse_goodput(slo_pairs):
+    gootput_config_dict = {}
+    try:
+        for slo_pair in slo_pairs:
+            slo_name, slo_val = slo_pair.split(":")
+            gootput_config_dict[slo_name] = float(slo_val)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(
+            "Invalid format found for service level objectives. "
+            "Specify service level objectives for goodput as \"KEY:VALUE\" "
+            "pairs, where the key is a metric name, and the value is a "
+            "number in milliseconds.") from err
+    return gootput_config_dict
 
 
 def main(args: argparse.Namespace):
@@ -646,7 +813,17 @@ def main(args: argparse.Namespace):
             dataset_split=args.hf_split,
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
+            random_seed=args.seed,
             fixed_output_len=args.hf_output_len,
+        )
+    elif args.dataset_name == "ocisvision":
+        input_requests = sample_ocisvision_requests(
+            im_width=args.im_width,
+            im_height=args.im_height,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_input_len=args.ov_input_len,
+            fixed_output_len=args.ov_output_len,
         )
 
     elif args.dataset_name == "random":
@@ -662,6 +839,8 @@ def main(args: argparse.Namespace):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
+    gootput_config_dict = check_goodput_args(args)
+
     benchmark_result = asyncio.run(
         benchmark(
             backend=backend,
@@ -673,6 +852,7 @@ def main(args: argparse.Namespace):
             logprobs=args.logprobs,
             best_of=args.best_of,
             request_rate=args.request_rate,
+            burstiness=args.burstiness,
             disable_tqdm=args.disable_tqdm,
             profile=args.profile,
             selected_percentile_metrics=args.percentile_metrics.split(","),
@@ -680,6 +860,8 @@ def main(args: argparse.Namespace):
                 float(p) for p in args.metric_percentiles.split(",")
             ],
             ignore_eos=args.ignore_eos,
+            gootput_config_dict=gootput_config_dict,
+            max_concurrency=args.max_concurrency,
         ))
 
     # Save config and results to json
@@ -709,13 +891,17 @@ def main(args: argparse.Namespace):
         # Traffic
         result_json["request_rate"] = (
             args.request_rate if args.request_rate < float("inf") else "inf")
+        result_json["burstiness"] = args.burstiness
+        result_json["max_concurrency"] = args.max_concurrency
 
         # Merge with benchmark result
         result_json = {**result_json, **benchmark_result}
 
         # Save to file
         base_model_id = model_id.split("/")[-1]
-        file_name = f"{backend}-{args.request_rate}qps-{base_model_id}-{current_dt}.json"  #noqa
+        max_concurrency_str = (f"-concurrency{args.max_concurrency}"
+                               if args.max_concurrency is not None else "")
+        file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  #noqa
         if args.result_filename:
             file_name = args.result_filename
         if args.result_dir:
@@ -758,7 +944,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "sonnet", "random", "hf"],
+        choices=["sharegpt", "sonnet", "random", "hf", "ocisvision"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument("--dataset-path",
@@ -766,6 +952,19 @@ if __name__ == "__main__":
                         default=None,
                         help="Path to the sharegpt/sonnet dataset. "
                         "Or the huggingface dataset ID if using HF dataset.")
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=None,
+        help="Maximum number of concurrent requests. This can be used "
+        "to help simulate an environment where a higher level component "
+        "is enforcing a maximum number of concurrent requests. While the "
+        "--request-rate argument controls the rate at which requests are "
+        "initiated, this argument will control how many are actually allowed "
+        "to execute at a time. This means that when used in combination, the "
+        "actual request rate may be lower than specified with --request-rate, "
+        "if the server is not processing requests fast enough to keep up.")
+
     parser.add_argument(
         "--model",
         type=str,
@@ -808,8 +1007,20 @@ if __name__ == "__main__":
         default=float("inf"),
         help="Number of requests per second. If this is inf, "
         "then all the requests are sent at time 0. "
-        "Otherwise, we use Poisson process to synthesize "
-        "the request arrival times.",
+        "Otherwise, we use Poisson process or gamma distribution "
+        "to synthesize the request arrival times.",
+    )
+    parser.add_argument(
+        "--burstiness",
+        type=float,
+        default=1.0,
+        help="Burstiness factor of the request generation. "
+        "Only take effect when request_rate is not inf. "
+        "Default value is 1, which follows Poisson process. "
+        "Otherwise, the request intervals follow a gamma distribution. "
+        "A lower burstiness value (0 < burstiness < 1) results in more "
+        "bursty requests. A higher burstiness value (burstiness > 1) "
+        "results in a more uniform arrival of requests.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -879,6 +1090,17 @@ if __name__ == "__main__":
         "Default value is \"99\". "
         "Use \"--percentile-metrics\" to select metrics.",
     )
+    parser.add_argument(
+        "--goodput",
+        nargs="+",
+        required=False,
+        help="Specify service level objectives for goodput as \"KEY:VALUE\" "
+        "pairs, where the key is a metric name, and the value is in "
+        "milliseconds. Multiple \"KEY:VALUE\" pairs can be provided, "
+        "separated by spaces. Allowed request level metric names are "
+        "\"ttft\", \"tpot\", \"e2el\". For more context on the definition of "
+        "goodput, refer to DistServe paper: https://arxiv.org/pdf/2401.09670 "
+        "and the blog: https://hao-ai-lab.github.io/blogs/distserve")
 
     # group for dataset specific arguments
     sonnet_group = parser.add_argument_group("sonnet dataset options")
@@ -959,6 +1181,33 @@ if __name__ == "__main__":
         help="Output length for each request. Overrides the output lengths "
         "from the sampled HF dataset.",
     )
+
+    ocisvision_group = parser.add_argument_group("ocisvision dataset options")
+    ocisvision_group.add_argument("--im-width",
+                          type=int,
+                          default=256,
+                          help="noise image width.")
+    ocisvision_group.add_argument("--im-height",
+                          type=int,
+                          default=256,
+                          help="noise image height.")
+    ocisvision_group.add_argument(
+        "--ov-output-len",
+        type=int,
+        default=None,
+        help="Output length for each request. Overrides the output lengths "
+        "from the sampled  dataset.",
+    )
+    ocisvision_group.add_argument(
+        "--ov-input-len",
+        type=int,
+        default=None,
+        help="Input length for each request. Overrides the input lengths "
+        "from the sampled  dataset.",
+    )
+
+
+
 
     args = parser.parse_args()
     main(args)
